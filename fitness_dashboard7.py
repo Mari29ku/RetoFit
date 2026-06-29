@@ -295,7 +295,7 @@ app.layout = html.Div(
                 html.Button("🔄 Actualizar", id="btn-refresh",
                             style={"backgroundColor":C_AZUL2,"color":C_BLANCO,"border":"none",
                                    "padding":"8px 18px","borderRadius":"6px","cursor":"pointer","fontSize":"0.9rem"}),
-                dcc.Interval(id="intervalo", interval=30_000, n_intervals=0),
+                dcc.Interval(id="intervalo", interval=144_0000, n_intervals=0),
                 html.Span(id="lbl-actualizacion", style={"color":"#BBBBEE","fontSize":"0.8rem"}),
             ]),
         ]),
