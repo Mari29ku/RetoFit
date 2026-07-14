@@ -17,7 +17,7 @@ import os
 EXCEL_PATH       = "fitness_registro.xlsx"
 MULTA_POR_DIA    = 100
 DIAS_META_SEMANA = 4
-META_DIAS_MES    = 16
+META_SEMANAS     = 4
 ANIO_RETO        = 2026
 
 # ── PALETA ────────────────────────────────────────────────────────────────────
@@ -27,16 +27,19 @@ C_VERDE    = "#276221"
 C_VERDE_BG = "#C6EFCE"
 C_ROJO     = "#9C0006"
 C_ROJO_BG  = "#FFC7CE"
+C_AMARILLO    = "#FFF2CC"
+C_AMARILLO_TX = "#7D6608"
 C_GRIS     = "#F5F5F5"
 C_BLANCO   = "#FFFFFF"
 
 REGLAS = [
-    ("🗓️", "Duración",     "1 mes — prueba piloto"),
-    ("💪", "Meta semanal", "4 días de actividad física por semana (lun–dom)"),
-    ("📋", "Registro",     "Anotar SI o NO en el Excel cada día hábil"),
-    ("💸", "Multa",        "$100 por cada día faltante para llegar a 4 en la semana"),
-    ("📌", "Ejemplo",      "Si hiciste 3 días esa semana → 1 día de multa = $100"),
-    ("✅", "Cumplimiento", "Semana perfecta = 4 días realizados, sin multa"),
+    ("🗓️", "Duración",       "1 mes — prueba piloto"),
+    ("💪", "Meta semanal",   "4 días de actividad física por semana (lun–dom)"),
+    ("📋", "Registro",       "Anotar SI, NO o INC en el Excel cada día"),
+    ("🤒", "Incapacidad",    "Escribir INC en cualquier día de la semana → semana congelada, sin multa y cuenta como semana perfecta"),
+    ("💸", "Multa",          "$100 por cada día faltante para llegar a 4 en la semana"),
+    ("📌", "Ejemplo",        "Si hiciste 3 días esa semana → 1 día de multa = $100"),
+    ("✅", "Cumplimiento",   "Semana perfecta = 4 días realizados o incapacidad, sin multa"),
 ]
 
 DIAS_ES = {0:"Lun", 1:"Mar", 2:"Mier", 3:"Jue", 4:"Vie", 5:"Sab", 6:"Dom"}
@@ -46,14 +49,12 @@ def col_a_fecha(col):
     try:
         p = col.strip().split()[-1].split("/")
         dia, mes = int(p[0]), int(p[1])
-        # Ajustar año: meses 6-12 → 2026, meses 1-5 → 2027 (si el reto cruza año)
         anio = ANIO_RETO if mes >= 6 else ANIO_RETO + 1
         return date(anio, mes, dia)
     except Exception:
         return None
 
 def es_dia_valido(col):
-    """Todos los días cuentan (lun-dom), excepto columnas sin fecha reconocible."""
     return col_a_fecha(col) is not None
 
 def num_semana(col, inicio):
@@ -69,7 +70,7 @@ def domingo_semana(col):
     f = col_a_fecha(col)
     if f is None:
         return None
-    return f + timedelta(days=(6 - f.weekday()))  # domingo = weekday 6
+    return f + timedelta(days=(6 - f.weekday()))
 
 # ── LEER DATOS ────────────────────────────────────────────────────────────────
 def leer_datos(path):
@@ -85,7 +86,6 @@ def leer_datos(path):
     cols_raw = [c for c in df_raw.columns
                 if c not in excluir and not c.startswith("Unnamed")]
 
-    # Si pandas convirtió alguna cabecera a datetime, formatearla de vuelta
     rename_map = {}
     for c in cols_raw:
         try:
@@ -97,13 +97,11 @@ def leer_datos(path):
         df_raw = df_raw.rename(columns=rename_map)
         cols_raw = [rename_map.get(c, c) for c in cols_raw]
 
-    # Todos los días con fecha válida (lun-dom)
-    cols_habiles = [c for c in cols_raw if es_dia_valido(c)]
-
-    fechas_validas = [col_a_fecha(c) for c in cols_habiles if col_a_fecha(c)]
-    if not fechas_validas:
+    cols_validas = [c for c in cols_raw if es_dia_valido(c)]
+    fechas_v = [col_a_fecha(c) for c in cols_validas if col_a_fecha(c)]
+    if not fechas_v:
         return pd.DataFrame()
-    inicio = min(fechas_validas)
+    inicio = min(fechas_v)
 
     rows = []
     for _, row in df_raw.iterrows():
@@ -111,12 +109,13 @@ def leer_datos(path):
         if pd.isna(nombre) or str(nombre).strip() == "":
             continue
         nombre = str(nombre).strip()
-        for col in cols_habiles:
+        for col in cols_validas:
             v = row[col]
             if hasattr(v, "iloc"):
                 v = v.iloc[0]
             val = str(v).strip().upper() if pd.notna(v) else ""
-            val = val if val in ("SI", "NO") else None
+            # Aceptar SI, NO e INC
+            val = val if val in ("SI", "NO", "INC") else None
             dom = domingo_semana(col)
             rows.append({
                 "participante": nombre,
@@ -140,30 +139,46 @@ def calcular_kpis(df):
         reg      = grp[grp["estado"].notna()]
         si_total = int((reg["estado"] == "SI").sum())
         no_total = int((reg["estado"] == "NO").sum())
+        inc_total = int((reg["estado"] == "INC").sum())
 
-        multa_total = 0
+        multa_total    = 0
+        semanas_ok     = 0  # semanas perfectas o con INC
+        semanas_contadas = 0
+
         for semana, sg in grp.groupby("semana"):
             if pd.isna(semana):
                 continue
-            # Semana cerrada = el domingo ya pasó
+
             dom_str = sg["domingo_sem"].dropna().iloc[0] if sg["domingo_sem"].notna().any() else None
             if dom_str is None:
                 continue
-            domingo = date.fromisoformat(dom_str)
+            domingo = date.fromisoformat(str(dom_str)[:10])
             if domingo >= hoy:
-                continue  # semana todavía en curso
+                continue  # semana en curso, no calcular
+
+            semanas_contadas += 1
+
+            # Si hay INC en cualquier día de la semana → semana congelada
+            tiene_inc = (sg["estado"] == "INC").any()
+            if tiene_inc:
+                semanas_ok += 1  # cuenta como perfecta
+                continue         # sin multa
 
             si_sem    = int((sg["estado"] == "SI").sum())
-            # Faltantes = cuántos días le faltaron para llegar a 4 (máx 4)
             faltantes = max(0, DIAS_META_SEMANA - si_sem)
             multa_total += faltantes * MULTA_POR_DIA
+            if faltantes == 0:
+                semanas_ok += 1
 
-        pct = round(si_total / META_DIAS_MES * 100, 1)
+        # % cumplimiento: semanas_ok / semanas_contadas (o sobre META_SEMANAS si aún no terminan)
+        base_pct = semanas_contadas if semanas_contadas > 0 else META_SEMANAS
+        pct = round(semanas_ok / META_SEMANAS * 100, 1)
+
         resumen.append({
             "Participante":   nombre,
             "Días ✓":         si_total,
             "Días ✗":         no_total,
-            "Días reg.":      si_total + no_total,
+            "Días INC":       inc_total,
             "% Cumplimiento": pct,
             "Multa ($)":      multa_total,
         })
@@ -233,21 +248,31 @@ def grafica_heatmap(df):
             return (99, 99)
     pivot = pivot.reindex(sorted(pivot.columns, key=orden), axis=1)
 
+    # 1=SI (verde), -1=NO (rojo), 0=sin registro (gris claro), 0.5=INC (amarillo)
     z, custom = [], []
     for _, row in pivot.iterrows():
         fz, fc = [], []
         for v in row:
-            if v == "SI":   fz.append(1);  fc.append("SI ✓")
-            elif v == "NO": fz.append(-1); fc.append("NO ✗")
-            else:           fz.append(0);  fc.append("Sin registro")
+            if v == "SI":    fz.append(1);    fc.append("SI ✓")
+            elif v == "NO":  fz.append(-1);   fc.append("NO ✗")
+            elif v == "INC": fz.append(0.5);  fc.append("INC 🤒")
+            else:            fz.append(0);    fc.append("Sin registro")
         z.append(fz); custom.append(fc)
+
+    colorscale = [
+        [0,    C_ROJO_BG],     # -1  NO
+        [0.5,  "#F0F0F0"],     #  0  sin registro
+        [0.75, C_AMARILLO],    #  0.5 INC
+        [1,    C_VERDE_BG],    #  1  SI
+    ]
 
     fig = go.Figure(go.Heatmap(
         z=z, x=list(pivot.columns), y=list(pivot.index),
-        colorscale=[[0, C_ROJO_BG], [0.5, "#F0F0F0"], [1, C_VERDE_BG]],
+        colorscale=colorscale,
         showscale=False,
         hovertemplate="<b>%{y}</b><br>%{x}<br>%{customdata}<extra></extra>",
         customdata=custom,
+        zmin=-1, zmax=1,
     ))
     fig.update_layout(**layout_base("Actividad diaria — mapa de calor", height=320))
     fig.update_xaxes(tickangle=45, tickfont_size=9)
@@ -273,6 +298,29 @@ def panel_reglas():
             html.H3("📌 Reglas del reto",
                     style={"color":C_AZUL,"marginTop":"0","fontSize":"1rem","marginBottom":"4px"}),
             html.Div(items),
+            # Leyenda heatmap
+            html.Div(style={"marginTop":"16px","display":"flex","gap":"12px","flexWrap":"wrap"}, children=[
+                html.Div(style={"display":"flex","alignItems":"center","gap":"6px"}, children=[
+                    html.Div(style={"width":"16px","height":"16px","backgroundColor":C_VERDE_BG,
+                                    "borderRadius":"3px","border":"1px solid #ccc"}),
+                    html.Span("SI", style={"fontSize":"0.8rem","color":"#444"}),
+                ]),
+                html.Div(style={"display":"flex","alignItems":"center","gap":"6px"}, children=[
+                    html.Div(style={"width":"16px","height":"16px","backgroundColor":C_ROJO_BG,
+                                    "borderRadius":"3px","border":"1px solid #ccc"}),
+                    html.Span("NO", style={"fontSize":"0.8rem","color":"#444"}),
+                ]),
+                html.Div(style={"display":"flex","alignItems":"center","gap":"6px"}, children=[
+                    html.Div(style={"width":"16px","height":"16px","backgroundColor":C_AMARILLO,
+                                    "borderRadius":"3px","border":"1px solid #ccc"}),
+                    html.Span("INC", style={"fontSize":"0.8rem","color":"#444"}),
+                ]),
+                html.Div(style={"display":"flex","alignItems":"center","gap":"6px"}, children=[
+                    html.Div(style={"width":"16px","height":"16px","backgroundColor":"#F0F0F0",
+                                    "borderRadius":"3px","border":"1px solid #ccc"}),
+                    html.Span("Sin registro", style={"fontSize":"0.8rem","color":"#444"}),
+                ]),
+            ]),
         ])
 
 # ── LAYOUT ────────────────────────────────────────────────────────────────────
@@ -295,7 +343,7 @@ app.layout = html.Div(
                 html.Button("🔄 Actualizar", id="btn-refresh",
                             style={"backgroundColor":C_AZUL2,"color":C_BLANCO,"border":"none",
                                    "padding":"8px 18px","borderRadius":"6px","cursor":"pointer","fontSize":"0.9rem"}),
-                dcc.Interval(id="intervalo", interval=144_0000, n_intervals=0),
+                dcc.Interval(id="intervalo", interval=30_000, n_intervals=0),
                 html.Span(id="lbl-actualizacion", style={"color":"#BBBBEE","fontSize":"0.8rem"}),
             ]),
         ]),
@@ -373,6 +421,7 @@ def actualizar_ui(data_json):
     avg_cumpl    = round(kpis["% Cumplimiento"].mean(), 1) if not kpis.empty else 0
     sin_multa    = int((kpis["Multa ($)"] == 0).sum()) if not kpis.empty else 0
     total_multas = int(kpis["Multa ($)"].sum()) if not kpis.empty else 0
+    con_inc      = int((kpis["Días INC"] > 0).sum()) if not kpis.empty else 0
 
     def card(icono, valor, etiqueta, color=C_AZUL):
         return html.Div(
@@ -387,9 +436,10 @@ def actualizar_ui(data_json):
             ])
 
     cards = [
-        card("📊", f"{avg_cumpl}%",      "Cumplimiento promedio"),
-        card("✅", f"{sin_multa}/{len(kpis)}", "Participantes sin multa", C_VERDE),
-        card("💸", f"${total_multas:,}", "Total multas acumuladas",  C_ROJO),
+        card("📊", f"{avg_cumpl}%",           "Cumplimiento promedio"),
+        card("✅", f"{sin_multa}/{len(kpis)}", "Participantes sin multa",     C_VERDE),
+        card("💸", f"${total_multas:,}",       "Total multas acumuladas",     C_ROJO),
+        card("🤒", f"{con_inc}/{len(kpis)}",   "Con incapacidad este mes",    C_AZUL2),
     ]
 
     cols_tabla = [c for c in kpis.columns if not c.startswith("_")]
@@ -404,6 +454,8 @@ def actualizar_ui(data_json):
              "color":C_ROJO,"fontWeight":"bold"},
             {"if":{"filter_query":"{% Cumplimiento} >= 100","column_id":"% Cumplimiento"},
              "color":C_VERDE,"fontWeight":"bold"},
+            {"if":{"filter_query":"{Días INC} > 0","column_id":"Días INC"},
+             "color":C_AMARILLO_TX,"fontWeight":"bold"},
             {"if":{"row_index":"odd"},"backgroundColor":C_GRIS},
         ],
         style_table={"overflowX":"auto"},
